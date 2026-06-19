@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import traceback
+import math
 
 HOST = os.environ.get("CHAT_SERVER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", os.environ.get("CHAT_SERVER_PORT", "8443")))
@@ -77,6 +78,24 @@ def _clean_reply(output: str) -> str:
 
 def _has_infra_words(text: str) -> bool:
     return bool(re.search(r"\b(Fly\.io|OpenRouter|Paperclip|Hermes|DeepSeek|Vercel|Supabase|token|webhook|infrastructure)\b", text, re.I))
+
+
+def estimate_tokens(text: str) -> int:
+    """Cheap tokenizer approximation for reporting until provider usage is exposed."""
+    if not text:
+        return 0
+    return max(1, math.ceil(len(text) / 4))
+
+
+def attach_usage(result: dict, input_text: str, output_text: str, *, provider: str, model: str) -> dict:
+    usage = dict(result.get("usage") or {})
+    usage.setdefault("input_tokens", estimate_tokens(input_text))
+    usage.setdefault("output_tokens", estimate_tokens(output_text))
+    usage.setdefault("provider", provider)
+    usage.setdefault("model", model)
+    usage.setdefault("estimated", True)
+    result["usage"] = usage
+    return result
 
 
 def _openrouter_short_reply(system_prompt: str, user_prompt: str) -> str | None:
@@ -185,11 +204,69 @@ Incoming message:
 """
 
 
+def _message_from_raw_update(payload: dict) -> dict:
+    raw = payload.get("raw_update") or {}
+    return raw.get("message") or raw.get("edited_message") or {}
+
+
+def _document_summary(message: dict) -> str:
+    document = message.get("document") or {}
+    if not isinstance(document, dict) or not document:
+        return ""
+    filename = str(document.get("file_name") or "").strip()
+    mime_type = str(document.get("mime_type") or "").strip()
+    parts = []
+    if filename:
+        parts.append(f"document={filename}")
+    if mime_type:
+        parts.append(f"mime={mime_type}")
+    return " ".join(parts)
+
+
+def _reply_context_text(payload: dict) -> str:
+    """Pull Telegram reply/forward context into the model-visible text.
+
+    Telegram sends the quoted/replied message inside raw_update.message.reply_to_message,
+    but the gateway's top-level text is only the new message (e.g. "this one").
+    Without this, Nova treats short follow-ups as ambiguous and may call Hermes until
+    timeout instead of updating the referenced landing-page artifact.
+    """
+    msg = _message_from_raw_update(payload)
+    contexts: list[str] = []
+    for source in (msg.get("reply_to_message"), msg.get("forward_origin", {}).get("message")):
+        if not isinstance(source, dict):
+            continue
+        snippet = str(source.get("text") or source.get("caption") or "").strip()
+        doc = _document_summary(source)
+        combined = " ".join(part for part in (snippet, doc) if part).strip()
+        if combined:
+            contexts.append(combined[:1000])
+    return "\n".join(contexts)
+
+
+def contextual_text(payload: dict) -> str:
+    text = str(payload.get("text") or "").strip()
+    context = _reply_context_text(payload)
+    if context:
+        return f"{text}\n\nReferenced Telegram message:\n{context}".strip()
+    return text
+
+
 def is_html_landing_request(text: str) -> bool:
     lower = text.lower()
     wants_html = "html" in lower or "landing page" in lower or "website" in lower
     action = any(word in lower for word in ("design", "make", "build", "create", "write", "draft"))
     return wants_html and action
+
+
+def is_landing_revision_request(text: str) -> bool:
+    lower = text.lower()
+    has_landing_context = any(term in lower for term in ("landing page", "website", ".html", "html", "document="))
+    has_revision_intent = any(term in lower for term in ("fix", "this one", "that one", "update", "improve", "missing", "appealing", "convert", "leads", "logo", "colours", "colors"))
+    has_domain = bool(re.search(r"\b[a-z0-9-]+\.(?:com|com\.au|net|org|ai|app|io|co|dev)\b", lower))
+    # If they reference a landing-page/file message or ask for lead/logo/domain revisions,
+    # return an artifact immediately instead of asking "which asset?".
+    return (has_landing_context and has_revision_intent) or (has_domain and has_revision_intent)
 
 
 def is_payment_request(text: str) -> bool:
@@ -244,7 +321,12 @@ def settings_reply(text: str = "") -> dict:
 
 def domain_from_text(text: str) -> str:
     match = re.search(r"\b([a-z0-9-]+\.(?:com|com\.au|net|org|ai|app|io|co|dev))\b", text.lower())
-    return match.group(1) if match else "yourbusiness.com"
+    if match:
+        return match.group(1)
+    filename_match = re.search(r"\b([a-z0-9-]+)-(com|net|org|ai|app|io|co|dev)(?:-[a-z0-9-]+)*\.html\b", text.lower())
+    if filename_match:
+        return f"{filename_match.group(1)}.{filename_match.group(2)}"
+    return "yourbusiness.com"
 
 
 def html_landing_artifact(text: str) -> dict:
@@ -305,15 +387,19 @@ def html_landing_artifact(text: str) -> dict:
 
 
 def run_hermes(payload: dict) -> dict:
-    text = str(payload.get("text") or "")
-    if is_html_landing_request(text):
-        return html_landing_artifact(text)
+    text = contextual_text(payload)
+    if is_html_landing_request(text) or is_landing_revision_request(text):
+        result = html_landing_artifact(text)
+        return attach_usage(result, text, result.get("reply", ""), provider="openrouter", model=DETERMINISTIC_REPLY_MODEL)
     if is_payment_request(text):
-        return payment_reply(text)
+        result = payment_reply(text)
+        return attach_usage(result, text, result.get("reply", ""), provider="openrouter", model=DETERMINISTIC_REPLY_MODEL)
     if is_settings_request(text):
-        return settings_reply(text)
+        result = settings_reply(text)
+        return attach_usage(result, text, result.get("reply", ""), provider="openrouter", model=DETERMINISTIC_REPLY_MODEL)
     if is_vague_business_automation_request(text):
-        return vague_business_reply(text)
+        result = vague_business_reply(text)
+        return attach_usage(result, text, result.get("reply", ""), provider="openrouter", model=DETERMINISTIC_REPLY_MODEL)
     prompt = _build_prompt(payload)
     env = os.environ.copy()
     env["HERMES_HOME"] = HERMES_HOME
@@ -334,7 +420,8 @@ def run_hermes(payload: dict) -> dict:
     combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
     if proc.returncode != 0:
         raise RuntimeError(f"Hermes exited {proc.returncode}: {combined[-2000:]}")
-    return {"reply": _clean_reply(combined)}
+    reply = _clean_reply(combined)
+    return attach_usage({"reply": reply}, prompt, reply, provider=CHAT_MODEL_PROVIDER, model=CHAT_MODEL_DEFAULT)
 
 
 class Handler(BaseHTTPRequestHandler):
