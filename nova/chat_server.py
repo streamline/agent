@@ -26,7 +26,9 @@ HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 HERMES_HOME = os.environ.get("HERMES_HOME", "/opt/data")
 TIMEOUT = int(os.environ.get("CHAT_TIMEOUT_SECONDS", "150"))
 MAX_TEXT = int(os.environ.get("CHAT_MAX_TEXT_CHARS", "6000"))
-DETERMINISTIC_REPLY_MODEL = os.environ.get("DETERMINISTIC_REPLY_MODEL", "deepseek/deepseek-chat-v3-0324:free")
+CHAT_MODEL_PROVIDER = os.environ.get("CHAT_MODEL_PROVIDER", "openrouter")
+CHAT_MODEL_DEFAULT = os.environ.get("CHAT_MODEL_DEFAULT", "deepseek/deepseek-v4-flash")
+DETERMINISTIC_REPLY_MODEL = os.environ.get("DETERMINISTIC_REPLY_MODEL", "meta-llama/llama-3.2-3b-instruct:free")
 DETERMINISTIC_REPLY_TIMEOUT = int(os.environ.get("DETERMINISTIC_REPLY_TIMEOUT_SECONDS", "20"))
 
 
@@ -320,7 +322,7 @@ def run_hermes(payload: dict) -> dict:
     # This machine is now HTTP-backed. Never let child chat accidentally poll Telegram.
     env.pop("HERMES_SESSION_CHAT_ID", None)
 
-    cmd = [HERMES_BIN, "chat", "-Q", "-q", prompt]
+    cmd = [HERMES_BIN, "chat", "-Q", "--provider", CHAT_MODEL_PROVIDER, "-m", CHAT_MODEL_DEFAULT, "-q", prompt]
     proc = subprocess.run(
         cmd,
         cwd=HERMES_HOME,
