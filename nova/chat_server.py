@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 import json
 import os
 import re
@@ -25,6 +26,8 @@ HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 HERMES_HOME = os.environ.get("HERMES_HOME", "/opt/data")
 TIMEOUT = int(os.environ.get("CHAT_TIMEOUT_SECONDS", "150"))
 MAX_TEXT = int(os.environ.get("CHAT_MAX_TEXT_CHARS", "6000"))
+DETERMINISTIC_REPLY_MODEL = os.environ.get("DETERMINISTIC_REPLY_MODEL", "deepseek/deepseek-chat-v3-0324:free")
+DETERMINISTIC_REPLY_TIMEOUT = int(os.environ.get("DETERMINISTIC_REPLY_TIMEOUT_SECONDS", "20"))
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -68,6 +71,75 @@ def _clean_reply(output: str) -> str:
     reply = "\n".join(cleaned).strip()
     return reply or "Done."
 
+
+
+def _has_infra_words(text: str) -> bool:
+    return bool(re.search(r"\b(Fly\.io|OpenRouter|Paperclip|Hermes|DeepSeek|Vercel|Supabase|token|webhook|infrastructure)\b", text, re.I))
+
+
+def _openrouter_short_reply(system_prompt: str, user_prompt: str) -> str | None:
+    """Use a cheap/free model for deterministic-intent reply wording.
+
+    Intent routing remains deterministic, but the user-facing sentence can vary.
+    If OpenRouter is unavailable, callers fall back to safe deterministic copy.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+
+    body = json.dumps(
+        {
+            "model": os.environ.get("DETERMINISTIC_REPLY_MODEL", DETERMINISTIC_REPLY_MODEL),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.65,
+            "max_tokens": 130,
+        }
+    ).encode("utf-8")
+    req = Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://sammm.app",
+            "X-Title": "Samantha Nova deterministic replies",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=DETERMINISTIC_REPLY_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        reply = str(data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    except Exception as exc:
+        print(f"free-model deterministic reply failed: {exc}", file=sys.stderr)
+        return None
+
+    if not reply or len(reply) > 900 or _has_infra_words(reply):
+        return None
+    return reply
+
+
+def model_shaped_reply(intent: str, text: str, fallback: str, *, required_terms: tuple[str, ...] = ()) -> str:
+    system_prompt = (
+        "You are Samantha replying in Telegram. The intent has already been routed deterministically; "
+        "only write the user-facing reply. Be warm, concise, natural, and useful. "
+        "Do not mention infrastructure, models, vendors, tokens, webhooks, or internal systems. "
+        "Do not add extra links beyond the required one. Ask at most one question."
+    )
+    required_line = ""
+    if required_terms:
+        required_line = "\nRequired exact text/link to include: " + " | ".join(required_terms)
+    user_prompt = f"Intent: {intent}\nIncoming user message: {text[:1000]}{required_line}\nWrite only the final Telegram reply."
+    reply = _openrouter_short_reply(system_prompt, user_prompt)
+    if not reply:
+        return fallback
+    lower = reply.lower()
+    if any(term.lower() not in lower for term in required_terms):
+        return fallback
+    return reply
 
 def _build_prompt(payload: dict) -> str:
     text = str(payload.get("text") or "").strip()[:MAX_TEXT]
@@ -141,30 +213,31 @@ def is_vague_business_automation_request(text: str) -> bool:
 def vague_business_reply(text: str) -> dict:
     lower = text.lower()
     if any(word in lower for word in ("barbería", "automatizar", "qué sigue", "reservas")):
-        return {"reply": "Perfecto — empezaría por reservas y recordatorios, porque reduce no-shows rápido y te ahorra mensajes manuales. ¿Hoy tus clientes agendan por WhatsApp, Instagram o llamadas?"}
-    return {"reply": "Best first move: automate bookings and follow-ups, because that saves time fast and reduces no-shows. What’s the main way customers book with you today?"}
+        fallback = "Perfecto — empezaría por reservas y recordatorios, porque reduce no-shows rápido y te ahorra mensajes manuales. ¿Hoy tus clientes agendan por WhatsApp, Instagram o llamadas?"
+        return {"reply": model_shaped_reply("vague Spanish business automation guidance", text, fallback)}
+    fallback = "Best first move: automate bookings and follow-ups, because that saves time fast and reduces no-shows. What’s the main way customers book with you today?"
+    return {"reply": model_shaped_reply("vague business automation guidance", text, fallback)}
 
 
-def payment_reply() -> dict:
+def payment_reply(text: str = "") -> dict:
     checkout_url = os.environ.get("STRIPE_STARTER_URL") or os.environ.get("STARTER_CHECKOUT_URL") or "https://sammm.app"
-    return {
-        "reply": (
-            "Yep — use this secure Stripe checkout link to keep going:\n"
-            f"{checkout_url}\n\n"
-            "Once it’s done, come back here and I’ll continue from where we left off."
-        )
-    }
+    fallback = (
+        "Yep — use this secure Stripe checkout link to keep going:\n"
+        f"{checkout_url}\n\n"
+        "Once it’s done, come back here and I’ll continue from where we left off."
+    )
+    return {"reply": model_shaped_reply("payment or upgrade checkout", text, fallback, required_terms=(checkout_url,))}
 
 
-def settings_reply() -> dict:
+def settings_reply(text: str = "") -> dict:
     settings_url = os.environ.get("SAMMM_SETTINGS_URL") or os.environ.get("SAMMM_PORTAL_URL") or "https://sammm.app/settings"
-    return {
-        "reply": (
-            "Open your Samantha settings here:\n"
-            f"{settings_url}\n\n"
-            "Use Telegram login so I can match it to this chat."
-        )
-    }
+    fallback = (
+        "Open your Samantha settings here:\n"
+        f"{settings_url}\n\n"
+        "Use Telegram login so I can match it to this chat."
+    )
+    reply = model_shaped_reply("settings or account access", text, fallback, required_terms=(settings_url, "Telegram"))
+    return {"reply": reply}
 
 
 def domain_from_text(text: str) -> str:
@@ -214,8 +287,10 @@ def html_landing_artifact(text: str) -> dict:
 </body>
 </html>
 """
+    fallback_reply = f"Done — I made a first-draft HTML landing page for {domain}. Open the attached file to preview it."
+    reply = model_shaped_reply("HTML landing-page file delivery", text, fallback_reply, required_terms=("attached file",))
     return {
-        "reply": f"Done — I made a first-draft HTML landing page for {domain}. Open the attached file to preview it.",
+        "reply": reply,
         "files": [
             {
                 "filename": filename,
@@ -232,9 +307,9 @@ def run_hermes(payload: dict) -> dict:
     if is_html_landing_request(text):
         return html_landing_artifact(text)
     if is_payment_request(text):
-        return payment_reply()
+        return payment_reply(text)
     if is_settings_request(text):
-        return settings_reply()
+        return settings_reply(text)
     if is_vague_business_automation_request(text):
         return vague_business_reply(text)
     prompt = _build_prompt(payload)
